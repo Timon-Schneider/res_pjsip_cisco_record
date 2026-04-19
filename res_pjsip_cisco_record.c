@@ -7,32 +7,48 @@
  *
  * Intercepts Cisco x-cisco-remotecc StartRecording / StopRecording REFER
  * requests (sent when the user presses the Record softkey on a CP-8xxx)
- * and drives MixMonitor on the active channel so the call is captured to
- * disk.  It also mirrors CUCM's wire behaviour by sending a follow-up
- * out-of-dialog REFER back to the phone whose body carries a
- * <statuslineupdatereq> — that is what makes the phone display show the
- * "Recording" banner and the red Record icon.
+ * and reproduces the exact SIP dance that a real CUCM14 performs so that
+ * the phone's own built-in softkey state machine flips to "Stop
+ * Recording" while recording is active.
  *
- * NOTE (per design): the module always pretends recording succeeded.
- * Even if MixMonitor fails to attach we still signal the phone that
- * recording is active.  This is intentional so the user's UI feedback
- * matches CUCM regardless of server-side recording setup.
+ * Wire sequence (matches a successful Wireshark capture against CUCM14):
  *
- * --- Toggle behaviour --------------------------------------------------
- * In reality the CP-8xxx phone never advances its Record softkey from
- * "Record" to "Stop" — only a very specific (undocumented) CUCM
- * RemoteCC response does that, and we don't emulate it.  As a result
- * every press of the Record softkey arrives at the PBX as another
- * <softkeyevent>StartRecording</softkeyevent>.
+ *   On StartRecording:
+ *     1.  PBX -> phone: 202 Accepted to the REFER.
+ *         (No NOTIFY: the REFER sets "Require: norefersub" so no
+ *          implicit subscription is created and none is needed.)
+ *     2.  PBX -> phone: two fresh out-of-main-dialog INVITEs back to
+ *         the phone's Contact URI, each carrying:
  *
- * To give the user a useful "press again to stop" experience the module
- * keeps a per-call-id set of currently-recording calls:
- *   1st StartRecording for a dialog → start MixMonitor + remember.
- *   2nd StartRecording for the same dialog → stop MixMonitor + forget.
- *   StopRecording (rare in practice) → always stops.
+ *           Call-Info:  <urn:x-cisco-remotecc:callinfo>; isVoip; \
+ *                       record-invoker=user
+ *           Join:       <main-call-id>;from-tag=<phone-tag>;\
+ *                       to-tag=<asterisk-tag>
+ *           Content-Disposition: session;handling=required
+ *           SDP:        a=label:X-relay-nearend   (1st leg)
+ *                       a=label:X-relay-farend    (2nd leg)
+ *                       + opus/48000/2 + ephemeral local UDP port
  *
- * Recorded files land in /var/spool/asterisk/monitor/ with the pattern
- *   cisco-<call-id>-<epoch>.wav
+ *         Seeing these two relay dialogs accepted is what drives the
+ *         phone's softkey state machine to display "Stop Recording" -
+ *         no proprietary statuslineupdatereq or other display hack is
+ *         involved.
+ *     3.  Recording to disk is driven by MixMonitor on the Asterisk
+ *         channel that is bridged to the main call, producing
+ *           /var/spool/asterisk/monitor/cisco-<call-id>-<epoch>.wav
+ *         exactly as in earlier revisions of this module.
+ *
+ *   On StopRecording (now really sent by the phone because the softkey
+ *   did flip):
+ *     1.  PBX -> phone: 202 Accepted.
+ *     2.  PBX -> phone: BYE on each of the two relay dialogs.
+ *     3.  StopMixMonitor on the bridged channel.
+ *
+ * We never consume the RTP the phone streams on the two relay legs;
+ * the advertised SDP ports are backed by UDP sockets we bind only so
+ * the kernel silently drops the packets, without ICMP unreachable
+ * bouncing back at the phone.  Actual audio capture continues to go
+ * through MixMonitor on the bridged channel.
  */
 
 /* Required for externally-compiled Asterisk modules */
@@ -63,92 +79,79 @@
 
 #include <pjsip.h>
 #include <pjsip_ua.h>
+#include <pjmedia.h>
 #include <pthread.h>
 
-/* ---------- per-call active-recording set ----------------------------- */
-/*
- * Cisco CP-8xxx phones do NOT internally remember that recording is
- * running: every press of the Record softkey sends another
- *   <softkeyevent>StartRecording</softkeyevent>
- * REFER (never a StopRecording) unless the call manager sends back a
- * very specific proprietary RemoteCC response that drives the phone's
- * softkey state machine to "Stop".  We don't emulate that so we keep the toggle state ourselves,
- * keyed by the Cisco dialog's call-id.
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+
+/* ---------- per-main-call relay-session table ------------------------ *
  *
- * First StartRecording for a call-id → start MixMonitor + remember it.
- * Subsequent StartRecording for the same call-id → stop MixMonitor +
- * forget it.
- * An explicit StopRecording (in the unlikely event a firmware actually
- * sends one) behaves the same as the "subsequent" case.
+ * For every call that is currently being recorded we keep a single
+ * entry keyed by the main Cisco dialog's Call-ID.  It owns:
+ *
+ *   - the identifying tags (for logging)
+ *   - the bridged Asterisk channel's name (so StopRecording can drive
+ *     StopMixMonitor without having to re-resolve the dialog, by which
+ *     time the channel may already be tearing down)
+ *   - the two relay-leg pjsip_inv_session pointers (so StopRecording
+ *     can BYE them via pjsip_inv_end_session); each is held with
+ *     pjsip_inv_add_ref and released with pjsip_inv_dec_ref
+ *   - the two UDP sockets bound for the advertised SDP ports.  We
+ *     never read from them; they are closed when the entry is torn
+ *     down.
  */
-struct rec_entry {
-    char call_id[256];
-    AST_LIST_ENTRY(rec_entry) list;
+struct relay_sess {
+    char main_callid[256];
+    char main_localtag[128];    /* phone's own tag (= XML <localtag>) */
+    char main_remotetag[128];   /* Asterisk's tag (= XML <remotetag>) */
+    char chan_name[AST_CHANNEL_NAME];
+    pjsip_inv_session *inv_nearend;
+    pjsip_inv_session *inv_farend;
+    int udp_fd_nearend;
+    int udp_fd_farend;
+    AST_LIST_ENTRY(relay_sess) list;
 };
 
-static AST_LIST_HEAD_STATIC(active_recs, rec_entry);
+static AST_LIST_HEAD_STATIC(relay_sessions, relay_sess);
 
-static int rec_is_active(const char *call_id)
+/* caller must hold the list lock */
+static struct relay_sess *relay_find_locked(const char *call_id)
 {
-    struct rec_entry *e;
-    int found = 0;
-    AST_LIST_LOCK(&active_recs);
-    AST_LIST_TRAVERSE(&active_recs, e, list) {
-        if (!strcmp(e->call_id, call_id)) {
-            found = 1;
-            break;
-        }
+    struct relay_sess *e;
+    AST_LIST_TRAVERSE(&relay_sessions, e, list) {
+        if (!strcmp(e->main_callid, call_id))
+            return e;
     }
-    AST_LIST_UNLOCK(&active_recs);
-    return found;
+    return NULL;
 }
 
-static void rec_add(const char *call_id)
+/* caller must hold the list lock */
+static struct relay_sess *relay_add_locked(const char *call_id,
+    const char *phone_tag, const char *asterisk_tag, const char *chan_name)
 {
-    struct rec_entry *e;
-    AST_LIST_LOCK(&active_recs);
-    AST_LIST_TRAVERSE(&active_recs, e, list) {
-        if (!strcmp(e->call_id, call_id)) {
-            AST_LIST_UNLOCK(&active_recs);
-            return; /* already there */
-        }
-    }
+    struct relay_sess *e = relay_find_locked(call_id);
+    if (e)
+        return e;
     e = ast_calloc(1, sizeof(*e));
-    if (!e) {
-        AST_LIST_UNLOCK(&active_recs);
-        return;
-    }
-    ast_copy_string(e->call_id, call_id, sizeof(e->call_id));
-    AST_LIST_INSERT_HEAD(&active_recs, e, list);
-    AST_LIST_UNLOCK(&active_recs);
+    if (!e)
+        return NULL;
+    ast_copy_string(e->main_callid, call_id, sizeof(e->main_callid));
+    ast_copy_string(e->main_localtag, phone_tag, sizeof(e->main_localtag));
+    ast_copy_string(e->main_remotetag, asterisk_tag,
+        sizeof(e->main_remotetag));
+    if (chan_name)
+        ast_copy_string(e->chan_name, chan_name, sizeof(e->chan_name));
+    e->udp_fd_nearend = -1;
+    e->udp_fd_farend = -1;
+    AST_LIST_INSERT_HEAD(&relay_sessions, e, list);
+    return e;
 }
 
-static void rec_remove(const char *call_id)
-{
-    struct rec_entry *e;
-    AST_LIST_LOCK(&active_recs);
-    AST_LIST_TRAVERSE_SAFE_BEGIN(&active_recs, e, list) {
-        if (!strcmp(e->call_id, call_id)) {
-            AST_LIST_REMOVE_CURRENT(list);
-            ast_free(e);
-            break;
-        }
-    }
-    AST_LIST_TRAVERSE_SAFE_END;
-    AST_LIST_UNLOCK(&active_recs);
-}
-
-static void rec_clear_all(void)
-{
-    struct rec_entry *e;
-    AST_LIST_LOCK(&active_recs);
-    while ((e = AST_LIST_REMOVE_HEAD(&active_recs, list))) {
-        ast_free(e);
-    }
-    AST_LIST_UNLOCK(&active_recs);
-}
-
-/* ---------- helpers (copied from res_pjsip_cisco_conference) ---------- */
+/* ---------- tiny XML helpers (same as previous revisions) ------------- */
 
 static int xml_get(const char *xml, const char *tag, char *out, size_t sz)
 {
@@ -195,7 +198,8 @@ static struct ast_channel *channel_for_dialog(const char *call_id,
     if (!dlg)
         dlg = pjsip_ua_find_dialog(&cid, &rtag, &ltag, PJ_TRUE);
     if (!dlg) {
-        ast_log(LOG_WARNING, "CiscoRecord: dialog not found for call-id='%s'\n", call_id);
+        ast_log(LOG_WARNING,
+            "CiscoRecord: dialog not found for call-id='%s'\n", call_id);
         return NULL;
     }
 
@@ -203,7 +207,8 @@ static struct ast_channel *channel_for_dialog(const char *call_id,
     pjsip_dlg_dec_lock(dlg);
 
     if (!session) {
-        ast_log(LOG_WARNING, "CiscoRecord: no session for call-id='%s'\n", call_id);
+        ast_log(LOG_WARNING,
+            "CiscoRecord: no session for call-id='%s'\n", call_id);
         return NULL;
     }
 
@@ -212,199 +217,131 @@ static struct ast_channel *channel_for_dialog(const char *call_id,
     ao2_ref(session, -1);
 
     if (!chan)
-        ast_log(LOG_WARNING, "CiscoRecord: no channel in session for call-id='%s'\n", call_id);
+        ast_log(LOG_WARNING,
+            "CiscoRecord: no channel in session for call-id='%s'\n", call_id);
 
     return chan;
 }
 
-/* ---------- refer-NOTIFY (RFC 3515) ------------------------------------
- *
- * Same pattern as the conference module: when we 202 Accept the phone's
- * REFER a fresh implicit subscription is born; we immediately terminate it
- * with a stateless NOTIFY so the Record softkey unlocks.
+/*
+ * Bind a UDP socket to 0.0.0.0:0 and return the ephemeral port.  The
+ * socket is deliberately never read from.  Its sole purpose is to keep
+ * a kernel RX hook alive on the advertised SDP port so RTP arriving
+ * from the phone is silently dropped rather than generating ICMP port
+ * unreachable replies.
  */
-static void cisco_rec_send_refer_notify(pjsip_rx_data *rdata,
-                                        const pj_str_t *local_tag)
+static int bind_ephemeral_udp(int *port_out)
 {
-    static const pjsip_method notify_method = {
-        PJSIP_OTHER_METHOD,
-        { "NOTIFY", 6 }
-    };
-    pjsip_endpoint *endpt = ast_sip_get_pjsip_endpoint();
-    pjsip_msg *msg = rdata->msg_info.msg;
-    pjsip_from_hdr *refer_from = rdata->msg_info.from;
-    pjsip_to_hdr   *refer_to   = rdata->msg_info.to;
-    pjsip_cid_hdr  *refer_cid  = rdata->msg_info.cid;
-    pjsip_contact_hdr *refer_contact;
-    pjsip_transport *tp = rdata->tp_info.transport;
-    pjsip_tx_data *tdata;
-    pj_status_t status;
-    pj_str_t target_s, from_s, to_s, contact_s, call_id_s;
-    pj_str_t hname, hval;
-    char target_buf[256], from_buf[512], to_buf[512];
-    char contact_buf[256];
-    int n;
+    struct sockaddr_in sa;
+    socklen_t slen = sizeof(sa);
+    int fd;
 
-    if (!refer_from || !refer_to || !refer_cid || !tp || !local_tag
-        || local_tag->slen == 0) {
-        ast_log(LOG_WARNING,
-            "CiscoRecord: cannot send refer-NOTIFY (missing headers/tag)\n");
-        return;
+    fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0)
+        return -1;
+
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_ANY);
+    sa.sin_port = 0;
+    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+        close(fd);
+        return -1;
     }
-
-    refer_contact = (pjsip_contact_hdr *)pjsip_msg_find_hdr(msg,
-        PJSIP_H_CONTACT, NULL);
-
-    n = pjsip_uri_print(PJSIP_URI_IN_REQ_URI,
-        refer_contact ? refer_contact->uri
-                      : pjsip_uri_get_uri(refer_from->uri),
-        target_buf, sizeof(target_buf) - 1);
-    if (n <= 0) return;
-    target_buf[n] = '\0';
-    target_s.ptr = target_buf; target_s.slen = n;
-
-    n = pjsip_uri_print(PJSIP_URI_IN_FROMTO_HDR, refer_to->uri,
-        from_buf, sizeof(from_buf) - 1);
-    if (n <= 0) return;
-    from_buf[n] = '\0';
-    from_s.ptr = from_buf; from_s.slen = n;
-
-    n = pjsip_uri_print(PJSIP_URI_IN_FROMTO_HDR, refer_from->uri,
-        to_buf, sizeof(to_buf) - 1);
-    if (n <= 0) return;
-    to_buf[n] = '\0';
-    to_s.ptr = to_buf; to_s.slen = n;
-
-    n = snprintf(contact_buf, sizeof(contact_buf),
-        "<sip:%.*s:%d>",
-        (int)tp->local_name.host.slen, tp->local_name.host.ptr,
-        tp->local_name.port);
-    contact_s.ptr = contact_buf; contact_s.slen = n;
-
-    call_id_s = refer_cid->id;
-
-    status = pjsip_endpt_create_request(endpt, &notify_method,
-        &target_s, &from_s, &to_s, &contact_s, &call_id_s,
-        -1, NULL, &tdata);
-    if (status != PJ_SUCCESS) {
-        ast_log(LOG_WARNING,
-            "CiscoRecord: pjsip_endpt_create_request(NOTIFY) failed: %d\n", status);
-        return;
+    if (getsockname(fd, (struct sockaddr *)&sa, &slen) != 0) {
+        close(fd);
+        return -1;
     }
-
-    {
-        pjsip_from_hdr *f = (pjsip_from_hdr *)pjsip_msg_find_hdr(tdata->msg,
-            PJSIP_H_FROM, NULL);
-        pjsip_to_hdr   *t = (pjsip_to_hdr *)pjsip_msg_find_hdr(tdata->msg,
-            PJSIP_H_TO,   NULL);
-        if (f) pj_strdup(tdata->pool, &f->tag, local_tag);
-        if (t) pj_strdup(tdata->pool, &t->tag, &refer_from->tag);
-    }
-
-    hname = pj_str("Event");
-    hval  = pj_str("refer");
-    pjsip_msg_add_hdr(tdata->msg, (pjsip_hdr *)
-        pjsip_generic_string_hdr_create(tdata->pool, &hname, &hval));
-
-    hname = pj_str("Subscription-State");
-    hval  = pj_str("terminated;reason=noresource");
-    pjsip_msg_add_hdr(tdata->msg, (pjsip_hdr *)
-        pjsip_generic_string_hdr_create(tdata->pool, &hname, &hval));
-
-    status = pjsip_endpt_send_request_stateless(endpt, tdata, NULL, NULL);
-    if (status != PJ_SUCCESS) {
-        ast_log(LOG_WARNING,
-            "CiscoRecord: pjsip_endpt_send_request_stateless(NOTIFY) failed: %d\n",
-            status);
-    }
+    *port_out = (int)ntohs(sa.sin_port);
+    return fd;
 }
 
-/* ---------- back-channel REFER that drives the display ---------------- */
-
-/*
- * Build & send an out-of-dialog REFER back to the phone whose body is a
- * <statuslineupdatereq>.
+/* ---------- relay-leg INVITE builder --------------------------------- *
  *
- *   Request-URI   = phone's Contact URI (from incoming REFER)
- *   From          = incoming REFER's To URI + fresh local tag
- *   To            = incoming REFER's From URI (no tag — this is a brand new
- *                   out-of-dialog transaction)
- *   Call-ID       = auto
- *   Content-Type  = application/x-cisco-remotecc-request+xml
- *   Refer-To      = cid:<contentid>
- *   Require       = norefersub
- *   Expires       = 0
+ * Open one relay-leg INVITE UAC dialog back to the phone.  Returns the
+ * pjsip_inv_session * with one additional reference held on behalf of
+ * the caller (so the caller may stash the pointer and later
+ * pjsip_inv_end_session + pjsip_inv_dec_ref it); returns NULL on
+ * failure, in which case the bound UDP fd has been closed too.
  *
- * dialog_* are the call's dialog coordinates (same as what we parsed from
- * the incoming REFER body); we swap localtag/remotetag in the OUTGOING body
- * because the tags must be written from Asterisk's perspective.
+ *   Request-URI  = phone's Contact URI (from incoming REFER)
+ *   From         = incoming REFER's To URI + fresh local tag (pjsip
+ *                  auto-generates the tag for UAC dialogs)
+ *   To           = incoming REFER's From URI (no tag - brand-new dialog)
+ *   Contact      = <sip:<ast-host>:<ast-port>>
+ *   Call-Info    = <urn:x-cisco-remotecc:callinfo>; isVoip; \
+ *                  record-invoker=user
+ *   Join         = <main-callid>;from-tag=<phone-tag>;to-tag=<ast-tag>
+ *   Content-Disposition = session;handling=required
+ *   Body         = application/sdp, opus/48000/2 offer, a=sendrecv,
+ *                  labelled X-relay-nearend or X-relay-farend
  */
-static void cisco_rec_send_status_refer(pjsip_rx_data *rdata,
-    const char *dialog_callid,
-    const char *dialog_phone_tag,
-    const char *dialog_asterisk_tag,
-    const char *status_text,
-    int display_timeout)
+static pjsip_inv_session *cisco_rec_send_relay_invite(
+    pjsip_rx_data *rdata,
+    const char *main_callid,
+    const char *phone_localtag,
+    const char *asterisk_tag,
+    const char *label,
+    int *udp_fd_out)
 {
-    /*
-     * PJSIP_REFER_METHOD is declared in pjsip-simple (the event-subscription
-     * framework), which external Asterisk modules don't necessarily link
-     * against.  The portable way is PJSIP_OTHER_METHOD + the name string —
-     * pjsip matches methods by name first, id second, so this is fully
-     * equivalent on the wire.
-     */
-    static const pjsip_method refer_method = {
-        PJSIP_OTHER_METHOD,
-        { "REFER", 5 }
-    };
-    pjsip_endpoint *endpt = ast_sip_get_pjsip_endpoint();
     pjsip_msg *msg = rdata->msg_info.msg;
     pjsip_from_hdr *refer_from = rdata->msg_info.from;
     pjsip_to_hdr   *refer_to   = rdata->msg_info.to;
     pjsip_contact_hdr *refer_contact;
     pjsip_transport *tp = rdata->tp_info.transport;
-    pjsip_tx_data *tdata;
+    pjsip_dialog *dlg = NULL;
+    pjsip_inv_session *inv = NULL;
+    pjsip_tx_data *tdata = NULL;
+    pjmedia_sdp_session *sdp = NULL;
     pj_status_t status;
-    pj_str_t target_s, from_s, to_s, contact_s;
+    pj_str_t target_s, local_uri_s, remote_uri_s, contact_s;
     pj_str_t hname, hval;
-    char target_buf[256], from_buf[512], to_buf[512], contact_buf[256];
-    char body_buf[2048];
-    char cid_buf[128], referto_buf[160], contentid_buf[160];
-    char tag_buf[64];
+    char target_buf[256], local_uri_buf[512], remote_uri_buf[512];
+    char contact_buf[256];
+    char sdp_buf[1024];
+    char callinfo_buf[256], join_buf[640];
+    int udp_port = 0, udp_fd = -1;
+    int inv_ref_held = 0;
     int n;
 
     if (!refer_from || !refer_to || !tp) {
         ast_log(LOG_WARNING,
-            "CiscoRecord: status REFER missing required headers\n");
-        return;
+            "CiscoRecord: missing headers for relay INVITE\n");
+        return NULL;
     }
 
     refer_contact = (pjsip_contact_hdr *)pjsip_msg_find_hdr(msg,
         PJSIP_H_CONTACT, NULL);
+    if (!refer_contact || !refer_contact->uri) {
+        ast_log(LOG_WARNING,
+            "CiscoRecord: REFER has no Contact, cannot open relay leg\n");
+        return NULL;
+    }
 
-    n = pjsip_uri_print(PJSIP_URI_IN_REQ_URI,
-        refer_contact ? refer_contact->uri
-                      : pjsip_uri_get_uri(refer_from->uri),
+    udp_fd = bind_ephemeral_udp(&udp_port);
+    if (udp_fd < 0) {
+        ast_log(LOG_WARNING,
+            "CiscoRecord: failed to bind ephemeral UDP socket for relay\n");
+        return NULL;
+    }
+
+    n = pjsip_uri_print(PJSIP_URI_IN_REQ_URI, refer_contact->uri,
         target_buf, sizeof(target_buf) - 1);
-    if (n <= 0) return;
+    if (n <= 0) goto fail;
     target_buf[n] = '\0';
     target_s.ptr = target_buf; target_s.slen = n;
 
-    /* From (ours) = REFER's To URI.  We patch a fresh tag onto the parsed
-     * header struct after request creation — same reason as in the NOTIFY
-     * builder (pjsip_endpt_create_request parses the URI string as a
-     * name-addr and rejects ";tag=" parameters). */
     n = pjsip_uri_print(PJSIP_URI_IN_FROMTO_HDR, refer_to->uri,
-        from_buf, sizeof(from_buf) - 1);
-    if (n <= 0) return;
-    from_buf[n] = '\0';
-    from_s.ptr = from_buf; from_s.slen = n;
+        local_uri_buf, sizeof(local_uri_buf) - 1);
+    if (n <= 0) goto fail;
+    local_uri_buf[n] = '\0';
+    local_uri_s.ptr = local_uri_buf; local_uri_s.slen = n;
 
     n = pjsip_uri_print(PJSIP_URI_IN_FROMTO_HDR, refer_from->uri,
-        to_buf, sizeof(to_buf) - 1);
-    if (n <= 0) return;
-    to_buf[n] = '\0';
-    to_s.ptr = to_buf; to_s.slen = n;
+        remote_uri_buf, sizeof(remote_uri_buf) - 1);
+    if (n <= 0) goto fail;
+    remote_uri_buf[n] = '\0';
+    remote_uri_s.ptr = remote_uri_buf; remote_uri_s.slen = n;
 
     n = snprintf(contact_buf, sizeof(contact_buf),
         "<sip:%.*s:%d>",
@@ -412,58 +349,84 @@ static void cisco_rec_send_status_refer(pjsip_rx_data *rdata,
         tp->local_name.port);
     contact_s.ptr = contact_buf; contact_s.slen = n;
 
-    status = pjsip_endpt_create_request(endpt, &refer_method,
-        &target_s, &from_s, &to_s, &contact_s, NULL /* auto Call-ID */,
-        -1 /* auto CSeq */, NULL, &tdata);
+    status = pjsip_dlg_create_uac(pjsip_ua_instance(),
+        &local_uri_s, &contact_s, &remote_uri_s, &target_s, &dlg);
     if (status != PJ_SUCCESS) {
         ast_log(LOG_WARNING,
-            "CiscoRecord: pjsip_endpt_create_request(REFER) failed: %d\n", status);
-        return;
+            "CiscoRecord: pjsip_dlg_create_uac failed: %d\n", status);
+        goto fail;
     }
 
-    /* Patch a fresh From tag onto the parsed header struct. */
-    snprintf(tag_buf, sizeof(tag_buf), "as%lx%lx",
-        (unsigned long)ast_random(), (unsigned long)ast_tvnow().tv_usec);
-    {
-        pjsip_from_hdr *f = (pjsip_from_hdr *)pjsip_msg_find_hdr(tdata->msg,
-            PJSIP_H_FROM, NULL);
-        if (f) {
-            pj_str_t tag_s = { tag_buf, (pj_ssize_t)strlen(tag_buf) };
-            pj_strdup(tdata->pool, &f->tag, &tag_s);
-        }
+    n = snprintf(sdp_buf, sizeof(sdp_buf),
+        "v=0\r\n"
+        "o=Asterisk %ld 1 IN IP4 %.*s\r\n"
+        "s=SIP Call\r\n"
+        "c=IN IP4 %.*s\r\n"
+        "t=0 0\r\n"
+        "m=audio %d RTP/AVP 114\r\n"
+        "a=label:%s\r\n"
+        "a=rtpmap:114 opus/48000/2\r\n"
+        "a=fmtp:114 maxplaybackrate=16000;sprop-maxcapturerate=16000;"
+        "maxaveragebitrate=64000;stereo=0;sprop-stereo=0;usedtx=0\r\n"
+        "a=sendrecv\r\n",
+        (long)ast_tvnow().tv_sec,
+        (int)tp->local_name.host.slen, tp->local_name.host.ptr,
+        (int)tp->local_name.host.slen, tp->local_name.host.ptr,
+        udp_port,
+        label);
+    if (n <= 0 || n >= (int)sizeof(sdp_buf)) {
+        ast_log(LOG_WARNING, "CiscoRecord: SDP buffer too small\n");
+        goto fail_after_dlg;
     }
 
-    /* Build a content-id value we'll use both as Refer-To ("cid:xxx") and
-     * as the Content-Id header.  This is the Cisco-proprietary pattern in
-     * CUCM: the REFER "refers to" its own body via cid. */
-    snprintf(cid_buf, sizeof(cid_buf), "as%lx@%.*s",
-        (unsigned long)ast_random(),
-        (int)tp->local_name.host.slen, tp->local_name.host.ptr);
-    snprintf(referto_buf,   sizeof(referto_buf),   "cid:%s", cid_buf);
-    snprintf(contentid_buf, sizeof(contentid_buf), "<%s>",   cid_buf);
+    status = pjmedia_sdp_parse(dlg->pool, sdp_buf, n, &sdp);
+    if (status != PJ_SUCCESS) {
+        ast_log(LOG_WARNING,
+            "CiscoRecord: pjmedia_sdp_parse failed: %d\n", status);
+        goto fail_after_dlg;
+    }
 
-    hname = pj_str("Refer-To");
-    hval.ptr = referto_buf; hval.slen = (pj_ssize_t)strlen(referto_buf);
+    status = pjsip_inv_create_uac(dlg, sdp, 0, &inv);
+    if (status != PJ_SUCCESS) {
+        ast_log(LOG_WARNING,
+            "CiscoRecord: pjsip_inv_create_uac failed: %d\n", status);
+        goto fail_after_dlg;
+    }
+
+    /*
+     * Bump the INV refcount so that it remains valid both across the
+     * rest of this function (if the far end somehow terminated it
+     * synchronously inside pjsip_inv_send_msg) and across the hand-off
+     * back to the caller who will later pjsip_inv_end_session +
+     * pjsip_inv_dec_ref.  We do NOT register our own INV callback --
+     * res_pjsip_session has already called pjsip_inv_usage_init once
+     * per endpoint, which is the only time that's allowed.  The INV
+     * layer handles auto-ACK on 2xx internally regardless of whether
+     * the registered callback touches our INV.
+     */
+    pjsip_inv_add_ref(inv);
+    inv_ref_held = 1;
+
+    status = pjsip_inv_invite(inv, &tdata);
+    if (status != PJ_SUCCESS) {
+        ast_log(LOG_WARNING,
+            "CiscoRecord: pjsip_inv_invite failed: %d\n", status);
+        pjsip_inv_terminate(inv, 500, PJ_FALSE);
+        goto fail_after_inv;
+    }
+
+    n = snprintf(callinfo_buf, sizeof(callinfo_buf),
+        "<urn:x-cisco-remotecc:callinfo>; isVoip; record-invoker=user");
+    hname = pj_str("Call-Info");
+    hval.ptr = callinfo_buf; hval.slen = n;
     pjsip_msg_add_hdr(tdata->msg, (pjsip_hdr *)
         pjsip_generic_string_hdr_create(tdata->pool, &hname, &hval));
 
-    hname = pj_str("Referred-By");
-    hval = from_s;
-    pjsip_msg_add_hdr(tdata->msg, (pjsip_hdr *)
-        pjsip_generic_string_hdr_create(tdata->pool, &hname, &hval));
-
-    hname = pj_str("Require");
-    hval  = pj_str("norefersub");
-    pjsip_msg_add_hdr(tdata->msg, (pjsip_hdr *)
-        pjsip_generic_string_hdr_create(tdata->pool, &hname, &hval));
-
-    {
-        pjsip_expires_hdr *exp = pjsip_expires_hdr_create(tdata->pool, 0);
-        pjsip_msg_add_hdr(tdata->msg, (pjsip_hdr *)exp);
-    }
-
-    hname = pj_str("Content-Id");
-    hval.ptr = contentid_buf; hval.slen = (pj_ssize_t)strlen(contentid_buf);
+    n = snprintf(join_buf, sizeof(join_buf),
+        "%s;from-tag=%s;to-tag=%s",
+        main_callid, phone_localtag, asterisk_tag);
+    hname = pj_str("Join");
+    hval.ptr = join_buf; hval.slen = n;
     pjsip_msg_add_hdr(tdata->msg, (pjsip_hdr *)
         pjsip_generic_string_hdr_create(tdata->pool, &hname, &hval));
 
@@ -472,51 +435,59 @@ static void cisco_rec_send_status_refer(pjsip_rx_data *rdata,
     pjsip_msg_add_hdr(tdata->msg, (pjsip_hdr *)
         pjsip_generic_string_hdr_create(tdata->pool, &hname, &hval));
 
-    /*
-     * Body: statuslineupdatereq.  The dialog-id tags are written from
-     * Asterisk's perspective, which is the opposite of what was in the
-     * incoming REFER's body:
-     *   outgoing <localtag>  = Asterisk's tag = incoming <remotetag>
-     *   outgoing <remotetag> = phone's tag    = incoming <localtag>
-     */
-    n = snprintf(body_buf, sizeof(body_buf),
-        "<?xml version=\"1.0\" encoding=\"iso-8859-1\"?>\n"
-        "<x-cisco-remotecc-request>\n"
-        "<statuslineupdatereq>\n"
-        "<action>notify_display</action>\n"
-        "<dialogid>\n"
-        "<callid>%s</callid>\n"
-        "<localtag>%s</localtag>\n"
-        "<remotetag>%s</remotetag>\n"
-        "</dialogid>\n"
-        "<statustext>%s</statustext>\n"
-        "<displaytimeout>%d</displaytimeout>\n"
-        "<priority>1</priority>\n"
-        "</statuslineupdatereq>\n"
-        "</x-cisco-remotecc-request>\n",
-        dialog_callid,
-        dialog_asterisk_tag, /* Asterisk's local */
-        dialog_phone_tag,    /* phone's remote   */
-        status_text,
-        display_timeout);
-
-    {
-        pj_str_t ct_type    = pj_str("application");
-        pj_str_t ct_subtype = pj_str("x-cisco-remotecc-request+xml");
-        pj_str_t body_str   = { body_buf, (pj_ssize_t)n };
-        tdata->msg->body = pjsip_msg_body_create(tdata->pool,
-            &ct_type, &ct_subtype, &body_str);
-    }
-
-    status = pjsip_endpt_send_request_stateless(endpt, tdata, NULL, NULL);
+    status = pjsip_inv_send_msg(inv, tdata);
     if (status != PJ_SUCCESS) {
         ast_log(LOG_WARNING,
-            "CiscoRecord: pjsip_endpt_send_request_stateless(REFER) failed: %d\n",
-            status);
-    } else {
-        ast_log(LOG_NOTICE,
-            "CiscoRecord: sent statuslineupdatereq REFER ('%s')\n",
-            status_text);
+            "CiscoRecord: pjsip_inv_send_msg(INVITE) failed: %d\n", status);
+        /* pjsip_inv_send_msg cleans tdata up internally on failure;
+         * terminate to release the inv's creation ref too so our
+         * subsequent pjsip_inv_dec_ref finishes destruction. */
+        pjsip_inv_terminate(inv, 500, PJ_FALSE);
+        goto fail_after_inv;
+    }
+
+    *udp_fd_out = udp_fd;
+    ast_log(LOG_NOTICE,
+        "CiscoRecord: sent relay INVITE label=%s local-port=%d\n",
+        label, udp_port);
+    return inv;
+
+fail_after_inv:
+    if (inv_ref_held) {
+        pjsip_inv_dec_ref(inv);
+        inv_ref_held = 0;
+    }
+    inv = NULL;
+    /* pjsip_inv_terminate (above) disassociates us from the dialog; the
+     * dialog's own usage release + our dec_ref cause destruction. */
+    goto fail;
+
+fail_after_dlg:
+    if (dlg)
+        pjsip_dlg_terminate(dlg);
+fail:
+    if (udp_fd >= 0) close(udp_fd);
+    return NULL;
+}
+
+/* ---------- BYE an inv ------------------------------------------------ */
+
+static void send_bye_inv(pjsip_inv_session *inv)
+{
+    pjsip_tx_data *tdata = NULL;
+    pj_status_t status;
+
+    if (!inv)
+        return;
+
+    status = pjsip_inv_end_session(inv, 200, NULL, &tdata);
+    if (status == PJ_SUCCESS && tdata) {
+        status = pjsip_inv_send_msg(inv, tdata);
+        if (status != PJ_SUCCESS) {
+            ast_log(LOG_WARNING,
+                "CiscoRecord: pjsip_inv_send_msg(BYE) failed: %d\n",
+                status);
+        }
     }
 }
 
@@ -524,7 +495,7 @@ static void cisco_rec_send_status_refer(pjsip_rx_data *rdata,
 
 struct rec_task {
     char chan_name[AST_CHANNEL_NAME];
-    int  start;        /* 1 = StartRecording, 0 = StopRecording */
+    int  start;         /* 1 = MixMonitor, 0 = StopMixMonitor */
     char filename[256];
 };
 
@@ -540,7 +511,7 @@ static void *cc_record_thread(void *data)
     chan = ast_channel_get_by_name(t->chan_name);
     if (!chan) {
         ast_log(LOG_WARNING,
-            "CiscoRecord: channel '%s' gone before MixMonitor could start\n",
+            "CiscoRecord: channel '%s' gone before (Stop)MixMonitor\n",
             t->chan_name);
         ast_free(t);
         return NULL;
@@ -556,8 +527,6 @@ static void *cc_record_thread(void *data)
             ast_log(LOG_NOTICE,
                 "CiscoRecord: starting MixMonitor on %s -> %s\n",
                 t->chan_name, t->filename);
-            /* No 'b' flag so we also record while the call is not yet
-             * bridged (holds, music-on-hold).  Use plain wav. */
             pbx_exec(chan, app, t->filename);
         }
     } else {
@@ -577,21 +546,59 @@ static void *cc_record_thread(void *data)
     return NULL;
 }
 
+static int spawn_mixmonitor_task(const char *chan_name, int start,
+    const char *callid_for_filename)
+{
+    struct rec_task *task;
+    pthread_attr_t attr;
+    pthread_t thr;
+
+    task = ast_calloc(1, sizeof(*task));
+    if (!task)
+        return -1;
+    ast_copy_string(task->chan_name, chan_name, sizeof(task->chan_name));
+    task->start = start;
+
+    if (start && callid_for_filename) {
+        char safe[128];
+        size_t i, j = 0;
+        for (i = 0; callid_for_filename[i] && j < sizeof(safe) - 1; i++) {
+            char c = callid_for_filename[i];
+            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                || (c >= '0' && c <= '9') || c == '-' || c == '_')
+                safe[j++] = c;
+            else
+                safe[j++] = '_';
+        }
+        safe[j] = '\0';
+        snprintf(task->filename, sizeof(task->filename),
+            "cisco-%s-%ld.wav", safe, (long)ast_tvnow().tv_sec);
+    }
+
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&thr, &attr, cc_record_thread, task) != 0) {
+        ast_log(LOG_ERROR, "CiscoRecord: pthread_create failed\n");
+        ast_free(task);
+        pthread_attr_destroy(&attr);
+        return -1;
+    }
+    pthread_attr_destroy(&attr);
+    return 0;
+}
+
 /* ---------- PJSIP receive callback ------------------------------------ */
 
 static pj_bool_t cisco_rec_on_rx_request(pjsip_rx_data *rdata)
 {
     pjsip_msg *msg = rdata->msg_info.msg;
+    pjsip_endpoint *endpt = ast_sip_get_pjsip_endpoint();
     pjsip_tx_data *resp;
     char body[8192], event[64], section[2048];
     char dlg_callid[256], dlg_ltag[128], dlg_rtag[128];
     const char *p, *q;
     size_t slen;
     int blen;
-    struct ast_channel *chan;
-    struct rec_task *task;
-    pthread_attr_t attr;
-    pthread_t thr;
     int is_start;
 
     if (pjsip_method_cmp(&msg->line.req.method, &pjsip_refer_method) != 0)
@@ -617,11 +624,11 @@ static pj_bool_t cisco_rec_on_rx_request(pjsip_rx_data *rdata)
     } else if (!strcasecmp(event, "StopRecording")) {
         is_start = 0;
     } else {
-        /* Not ours — let res_pjsip_cisco_conference or friends see it. */
+        /* Not ours - let res_pjsip_cisco_conference or friends see it. */
         return PJ_FALSE;
     }
 
-    /* Parse <dialogid> — the call we're recording. */
+    /* Parse <dialogid> - the call we're (de-)recording. */
     p = strstr(body, "<dialogid>");
     q = strstr(body, "</dialogid>");
     if (!p || !q) goto malformed;
@@ -634,140 +641,129 @@ static pj_bool_t cisco_rec_on_rx_request(pjsip_rx_data *rdata)
         xml_get(section, "remotetag", dlg_rtag,   sizeof(dlg_rtag)))
         goto malformed;
 
-    /*
-     * Toggle: the phone's softkey doesn't advance to "Stop", so every
-     * press sends another StartRecording.  We turn the second
-     * StartRecording for the same dialog call-id into a Stop.  An
-     * explicit StopRecording (rare) just falls straight through.
-     */
-    if (is_start && rec_is_active(dlg_callid)) {
-        ast_log(LOG_NOTICE,
-            "CiscoRecord: StartRecording REFER for call-id='%s' "
-            "but recording already active — treating as STOP\n",
-            dlg_callid);
-        is_start = 0;
-    }
-
     ast_log(LOG_NOTICE,
-        "CiscoRecord: %s REFER — call-id='%s'\n",
+        "CiscoRecord: %s REFER - call-id='%s'\n",
         is_start ? "StartRecording" : "StopRecording", dlg_callid);
 
-    chan = channel_for_dialog(dlg_callid, dlg_ltag, dlg_rtag);
-    /* No channel?  We still pretend recording worked — the phone UI gets
-     * the display update and we log.  (User request: never look like a
-     * failure on the phone.) */
-    if (!chan) {
-        ast_log(LOG_WARNING,
-            "CiscoRecord: no channel for call-id='%s' — will still "
-            "send display update to phone\n", dlg_callid);
-    }
-
-    /* ---- send 202 Accepted ----------------------------------------- */
-    char local_tag_buf[128] = "";
-    pj_str_t local_tag = { NULL, 0 };
-
-    if (pjsip_endpt_create_response(ast_sip_get_pjsip_endpoint(),
-            rdata, 202, NULL, &resp) == PJ_SUCCESS) {
-        pjsip_to_hdr *to_h = (pjsip_to_hdr *)pjsip_msg_find_hdr(
-            resp->msg, PJSIP_H_TO, NULL);
-        if (to_h && to_h->tag.slen > 0) {
-            int tlen = (int)to_h->tag.slen;
-            if (tlen > (int)sizeof(local_tag_buf) - 1)
-                tlen = sizeof(local_tag_buf) - 1;
-            memcpy(local_tag_buf, to_h->tag.ptr, tlen);
-            local_tag_buf[tlen] = '\0';
-            local_tag.ptr = local_tag_buf;
-            local_tag.slen = tlen;
-        }
-        pjsip_endpt_send_response2(ast_sip_get_pjsip_endpoint(),
-            rdata, resp, NULL, NULL);
+    /* Always 202 Accepted the REFER up front (what real CUCM does). */
+    if (pjsip_endpt_create_response(endpt, rdata, 202, NULL, &resp)
+            == PJ_SUCCESS) {
+        pjsip_endpt_send_response2(endpt, rdata, resp, NULL, NULL);
     } else {
         ast_log(LOG_ERROR, "CiscoRecord: could not create 202 response\n");
     }
 
-    /* Terminate the implicit subscription so the Record softkey unlocks. */
-    cisco_rec_send_refer_notify(rdata, &local_tag);
+    if (is_start) {
+        struct ast_channel *chan;
+        struct relay_sess *e;
+        char chan_name[AST_CHANNEL_NAME] = "";
+        pjsip_inv_session *inv_near = NULL, *inv_far = NULL;
+        int udp_fd_near = -1, udp_fd_far = -1;
+        int adopted = 0;
 
-    /* ---- display update REFER to phone ---------------------------- */
-    /* is_start → "Recording" banner for 10 s, auto-refreshed by phone.
-     * Phone's dictionary has no localized entry for this free-form text,
-     * it simply shows it verbatim on the status line.
-     *
-     * Stop → "Recording stopped" for 5 s, so the user gets an explicit
-     * confirmation that the press toggled recording off (otherwise the
-     * banner would just silently disappear and it's easy to doubt
-     * whether the press registered).  The phone clears the banner
-     * automatically when the timeout expires.
-     */
-    cisco_rec_send_status_refer(rdata, dlg_callid, dlg_ltag, dlg_rtag,
-        is_start ? "Recording" : "Recording stopped",
-        is_start ? 10 : 5);
-
-    /* ---- drive MixMonitor on the channel -------------------------- */
-    if (chan) {
-        task = ast_calloc(1, sizeof(*task));
-        if (!task) {
-            ast_channel_unref(chan);
+        chan = channel_for_dialog(dlg_callid, dlg_ltag, dlg_rtag);
+        if (!chan) {
+            ast_log(LOG_WARNING,
+                "CiscoRecord: no channel for call-id='%s' - skipping "
+                "recording (softkey will not flip)\n", dlg_callid);
             return PJ_TRUE;
         }
-        ast_copy_string(task->chan_name, ast_channel_name(chan),
-            sizeof(task->chan_name));
-        task->start = is_start;
-        if (is_start) {
-            /* Sanitise dlg_callid for use in a filename (strip '@' and such). */
-            char safe[128];
-            size_t i, j = 0;
-            for (i = 0; dlg_callid[i] && j < sizeof(safe) - 1; i++) {
-                char c = dlg_callid[i];
-                if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
-                    || (c >= '0' && c <= '9') || c == '-' || c == '_')
-                    safe[j++] = c;
-                else
-                    safe[j++] = '_';
-            }
-            safe[j] = '\0';
-            snprintf(task->filename, sizeof(task->filename),
-                "cisco-%s-%ld.wav", safe, (long)ast_tvnow().tv_sec);
-        }
+        ast_copy_string(chan_name, ast_channel_name(chan), sizeof(chan_name));
         ast_channel_unref(chan);
 
-        pthread_attr_init(&attr);
-        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-        if (pthread_create(&thr, &attr, cc_record_thread, task) != 0) {
-            ast_log(LOG_ERROR, "CiscoRecord: pthread_create failed\n");
-            ast_free(task);
-        } else {
-            /*
-             * Only update the toggle set when the worker was actually
-             * scheduled.  rec_add is idempotent; rec_remove on a missing
-             * entry is a no-op.  (We don't try to rollback if MixMonitor
-             * itself fails inside the thread — the user-visible UI is
-             * still "Recording" per design.)
-             */
-            if (is_start)
-                rec_add(dlg_callid);
-            else
-                rec_remove(dlg_callid);
+        AST_LIST_LOCK(&relay_sessions);
+        if (relay_find_locked(dlg_callid)) {
+            AST_LIST_UNLOCK(&relay_sessions);
+            ast_log(LOG_NOTICE,
+                "CiscoRecord: call-id='%s' already being recorded - "
+                "ignoring duplicate StartRecording\n", dlg_callid);
+            return PJ_TRUE;
         }
-        pthread_attr_destroy(&attr);
+        e = relay_add_locked(dlg_callid, dlg_ltag, dlg_rtag, chan_name);
+        AST_LIST_UNLOCK(&relay_sessions);
+        if (!e) {
+            ast_log(LOG_ERROR, "CiscoRecord: out of memory\n");
+            return PJ_TRUE;
+        }
+
+        /* Build & send the two relay legs. */
+        inv_near = cisco_rec_send_relay_invite(rdata,
+            dlg_callid, dlg_ltag, dlg_rtag,
+            "X-relay-nearend", &udp_fd_near);
+        inv_far  = cisco_rec_send_relay_invite(rdata,
+            dlg_callid, dlg_ltag, dlg_rtag,
+            "X-relay-farend", &udp_fd_far);
+
+        /* Transfer the INV refs + UDP fds to the table entry. */
+        AST_LIST_LOCK(&relay_sessions);
+        e = relay_find_locked(dlg_callid);
+        if (e) {
+            e->inv_nearend = inv_near;
+            e->inv_farend  = inv_far;
+            e->udp_fd_nearend = udp_fd_near;
+            e->udp_fd_farend  = udp_fd_far;
+            adopted = 1;
+        }
+        AST_LIST_UNLOCK(&relay_sessions);
+
+        if (!adopted) {
+            /* Extremely unlikely - entry vanished while we were busy. */
+            if (inv_near) { send_bye_inv(inv_near); pjsip_inv_dec_ref(inv_near); }
+            if (inv_far)  { send_bye_inv(inv_far);  pjsip_inv_dec_ref(inv_far); }
+            if (udp_fd_near >= 0) close(udp_fd_near);
+            if (udp_fd_far >= 0) close(udp_fd_far);
+        }
+
+        spawn_mixmonitor_task(chan_name, 1, dlg_callid);
     } else {
-        /* No channel found at all — keep the set consistent with what
-         * the phone believes.  If this was supposed to be a Start it
-         * would have been toggled to Stop above (because a prior Start
-         * put us in the set); treat the else branch as "we're done
-         * with this call-id". */
-        if (!is_start)
-            rec_remove(dlg_callid);
+        struct relay_sess *e;
+        char chan_name[AST_CHANNEL_NAME] = "";
+        pjsip_inv_session *inv_near = NULL, *inv_far = NULL;
+        int udp_fd_near = -1, udp_fd_far = -1;
+
+        AST_LIST_LOCK(&relay_sessions);
+        AST_LIST_TRAVERSE_SAFE_BEGIN(&relay_sessions, e, list) {
+            if (!strcmp(e->main_callid, dlg_callid)) {
+                AST_LIST_REMOVE_CURRENT(list);
+                ast_copy_string(chan_name, e->chan_name, sizeof(chan_name));
+                inv_near = e->inv_nearend; e->inv_nearend = NULL;
+                inv_far  = e->inv_farend;  e->inv_farend  = NULL;
+                udp_fd_near = e->udp_fd_nearend; e->udp_fd_nearend = -1;
+                udp_fd_far  = e->udp_fd_farend;  e->udp_fd_farend  = -1;
+                ast_free(e);
+                break;
+            }
+        }
+        AST_LIST_TRAVERSE_SAFE_END;
+        AST_LIST_UNLOCK(&relay_sessions);
+
+        if (inv_near) {
+            send_bye_inv(inv_near);
+            pjsip_inv_dec_ref(inv_near);
+        }
+        if (inv_far) {
+            send_bye_inv(inv_far);
+            pjsip_inv_dec_ref(inv_far);
+        }
+        if (udp_fd_near >= 0) close(udp_fd_near);
+        if (udp_fd_far >= 0) close(udp_fd_far);
+
+        if (chan_name[0]) {
+            spawn_mixmonitor_task(chan_name, 0, NULL);
+        } else {
+            ast_log(LOG_NOTICE,
+                "CiscoRecord: StopRecording for unknown call-id='%s' "
+                "- nothing to tear down\n", dlg_callid);
+        }
     }
 
     return PJ_TRUE;
 
 malformed:
     ast_log(LOG_WARNING, "CiscoRecord: malformed x-cisco-remotecc body\n");
-    if (pjsip_endpt_create_response(ast_sip_get_pjsip_endpoint(),
-            rdata, 400, NULL, &resp) == PJ_SUCCESS)
-        pjsip_endpt_send_response2(ast_sip_get_pjsip_endpoint(),
-            rdata, resp, NULL, NULL);
+    if (pjsip_endpt_create_response(endpt, rdata, 400, NULL, &resp)
+            == PJ_SUCCESS)
+        pjsip_endpt_send_response2(endpt, rdata, resp, NULL, NULL);
     return PJ_TRUE;
 }
 
@@ -777,7 +773,7 @@ static pjsip_module cisco_rec_pjsip_module = {
     .name     = { "mod-cisco-record", 17 },
     /*
      * Lower = higher priority.  res_pjsip_cisco_conference sits at
-     * APPLICATION-1 (31) and consumes *all* x-cisco-remotecc REFERs —
+     * APPLICATION-1 (31) and consumes *all* x-cisco-remotecc REFERs -
      * silently 200-OK'ing any softkey it doesn't recognise (including
      * StartRecording / StopRecording).  We therefore register at
      * APPLICATION-2 (30) so we see the REFER first; if the event isn't
@@ -799,8 +795,31 @@ static int load_module(void)
 
 static int unload_module(void)
 {
+    struct relay_sess *e;
+
     ast_sip_unregister_service(&cisco_rec_pjsip_module);
-    rec_clear_all();
+
+    /* Best-effort: BYE every still-live relay leg, close dummy sockets,
+     * free the table entries.  The phone will drop its local recording
+     * state when the BYEs arrive. */
+    AST_LIST_LOCK(&relay_sessions);
+    while ((e = AST_LIST_REMOVE_HEAD(&relay_sessions, list))) {
+        if (e->inv_nearend) {
+            send_bye_inv(e->inv_nearend);
+            pjsip_inv_dec_ref(e->inv_nearend);
+            e->inv_nearend = NULL;
+        }
+        if (e->inv_farend) {
+            send_bye_inv(e->inv_farend);
+            pjsip_inv_dec_ref(e->inv_farend);
+            e->inv_farend = NULL;
+        }
+        if (e->udp_fd_nearend >= 0) close(e->udp_fd_nearend);
+        if (e->udp_fd_farend  >= 0) close(e->udp_fd_farend);
+        ast_free(e);
+    }
+    AST_LIST_UNLOCK(&relay_sessions);
+
     return 0;
 }
 
